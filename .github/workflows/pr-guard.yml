@@ -1,0 +1,109 @@
+# 公开侧的服务端闸门。
+#
+# 为什么需要它：客户端钩子（pre-push 等）**可以被绕过** —— --no-verify、别的克隆、
+# 网页端提交都不经过它们。这个工作流是绕过客户端之后的第二道。
+#
+# ⚠️ **它拦得住什么、拦不住什么**（别把能力说大）：
+#   ✅ 拦得住：提交进公开仓的**密钥**（gitleaks 内置规则）、**禁止路径**、以及
+#      **push 到公开分支时混进来的单父非发布提交**。
+#   ❌ 拦不住：**私有词表**。词表（.gitleaks.toml）是私有配置，**不随发布公开**，
+#      所以服务端拿不到它 —— 私有工作流词汇只有**客户端**那道发布闸门在查。
+#      这一条是结构性限制，不是没做，见 docs/RISKS.md L7。
+#
+# ⚠️ 本文件**原样复制**（不是 .jinja），下面的 ${{ ... }} 是 GitHub Actions 语法，
+#    不是模板占位符，**不要**被渲染。因此触发分支**写死 `main`** ——
+#    若把 copier 的 public_branch 改成别的，必须手工改这里（见 RISKS.md L8）。
+name: pr-guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: 密钥扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 扫描工作树里的密钥
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --no-git --redact -v
+
+  release-shape:
+    name: 发布形态检查
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 判据与客户端 pre-push 同口径：**单父**提交必须是 `release vX.Y.Z`。
+      # 为什么允许 merge 提交：贡献者 PR 走网页合并时会产生 merge 提交，那是公开侧的
+      # 正常形态（把公开侧改动搬回私有侧的能力属于 v2 范围）。而"有人把 dev 提交
+      # 直接推上来"产生的是单父非发布提交 —— 那正是要拦的东西。
+      - name: 公开分支只接受 release 提交（merge 提交除外）
+        run: |
+          before="${{ github.event.before }}"
+          after="${{ github.sha }}"
+          zero=0000000000000000000000000000000000000000
+          if [ "$before" = "$zero" ]; then
+            range="$after"
+          else
+            range="$before..$after"
+          fi
+          bad=0
+          for c in $(git rev-list "$range"); do
+            nparents=$(git rev-list --parents -n1 "$c" | wc -w)
+            subject=$(git log -1 --format=%s "$c")
+            # nparents 含自身，所以单父提交 = 2
+            if [ "$nparents" -gt 2 ]; then
+              continue   # merge 提交：贡献者 PR 的正常形态，放行
+            fi
+            if printf '%s\n' "$subject" | grep -qE '^release v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+              continue
+            fi
+            echo "::error::$c 是单父提交但不是发布提交（subject='$subject'）"
+            bad=1
+          done
+          if [ "$bad" != 0 ]; then
+            echo "公开分支混进了非发布提交。"
+            echo "若这是贡献者 PR 的 squash 合并：公开侧已偏离发布形态，"
+            echo "发布工具也会因此拒绝发布（exit 6），需要人工处理（回收能力属于 v2 范围）。"
+            exit 1
+          fi
+
+  title:
+    name: PR 标题规范
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查标题是否符合 Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" | grep -qE \
+            '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+' \
+            || { echo "PR 标题须符合 Conventional Commits，收到：$TITLE"; exit 1; }
+
+  files:
+    name: 文件规范
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查禁止路径
+        run: |
+          bad=$(git ls-files \
+            | grep -iE '(^|/)\.env($|\.)|(^|/)(node_modules|\.venv|venv|__pycache__|dist|build|out|target)/|(^|/)(id_rsa|\.npmrc|\.pypirc|credentials\.json|\.DS_Store|Thumbs\.db)' \
+            | grep -ivE '(^|/)\.env\.example$' || true)
+          if [ -n "$bad" ]; then
+            echo "出现不该提交的路径："
+            printf '%s\n' "$bad"
+            exit 1
+          fi
